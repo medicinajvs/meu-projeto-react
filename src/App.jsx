@@ -10,6 +10,7 @@ const API_KEY = 'AIzaSyBCi_WyOv0M6QPiIklXgP4DshN8Y6vWM3s';
 const GOOGLE_AI_KEY = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_GOOGLE_AI_KEY) ? import.meta.env.VITE_GOOGLE_AI_KEY : '';
 const IMAGEN_API_KEY = GOOGLE_AI_KEY;
 const GEMINI_API_KEY = GOOGLE_AI_KEY;
+const GEMINI_SHARE_URL = 'https://gemini.google.com/share/707da09a785d';
 const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest';
 const SCOPES = 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/userinfo.email';
 
@@ -128,6 +129,10 @@ export default function App() {
 
     // Preview Modal
     const [previewCard, setPreviewCard] = useState(null);
+
+    // Importação de Q/A (JSON)
+    const [isImportingJson, setIsImportingJson] = useState(false);
+    const [importJsonName, setImportJsonName] = useState('');
 
     // Refs
     const tokenClientRef = useRef(null);
@@ -584,6 +589,101 @@ export default function App() {
             await fetchMonthEvents();
             fetchUpcomingEvents();
         } catch (err) { if (!silent) showToast("Erro ao agendar", "error"); }
+    };
+
+    // --- IMPORTAÇÃO (JSON Q/A) ---
+    const normalizeQaJson = (parsed) => {
+        // Aceita formatos:
+        // 1) [{ question, answer, subject?, concept? }, ...]
+        // 2) { flashcards: [...] } | { cards: [...] } | { data: [...] }
+        // 3) { "Pergunta": "Resposta", ... }
+
+        const pickArray = (obj) => {
+            if (!obj || typeof obj !== 'object') return null;
+            if (Array.isArray(obj)) return obj;
+            const keys = ['flashcards', 'cards', 'data', 'items', 'perguntas'];
+            for (const k of keys) {
+                if (Array.isArray(obj[k])) return obj[k];
+            }
+            return null;
+        };
+
+        const arr = pickArray(parsed);
+        if (arr) return arr;
+
+        if (parsed && typeof parsed === 'object') {
+            // Mapa simples { pergunta: resposta }
+            return Object.entries(parsed).map(([question, answer]) => ({ question, answer }));
+        }
+
+        return [];
+    };
+
+    const importFlashcardsFromJsonFile = async (file) => {
+        if (!file) return;
+        setIsImportingJson(true);
+        try {
+            const text = await file.text();
+            const parsed = JSON.parse(text);
+            const items = normalizeQaJson(parsed)
+                .filter(Boolean)
+                .map((it) => {
+                    if (typeof it === 'string') return null;
+                    const question = (it.question ?? it.pergunta ?? it.q ?? '').toString().trim();
+                    const answer = (it.answer ?? it.resposta ?? it.a ?? '').toString().trim();
+                    const subject = (it.subject ?? it.materia ?? it.matéria ?? '').toString().trim();
+                    const concept = (it.concept ?? it.conceito ?? '').toString().trim();
+                    if (!question || !answer) return null;
+                    return { question, answer, subject, concept };
+                })
+                .filter(Boolean);
+
+            if (!items.length) {
+                showToast('JSON válido, mas sem perguntas/respostas reconhecíveis.', 'error');
+                return;
+            }
+
+            const defaultSubject = (form.subject || 'Importado').trim();
+            const defaultConcept = (form.concept || 'Geral').trim();
+
+            const now = Date.now();
+            const newCards = items.map((it, idx) => {
+                const qHtml = (it.question || '').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+                const aHtml = (it.answer || '').replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+                return {
+                    id: now + idx,
+                    subject: it.subject || defaultSubject,
+                    concept: it.concept || defaultConcept,
+                    question: it.question,
+                    answer: it.answer,
+                    image: null,
+                    images: [],
+                    activeImageId: null,
+                    frontTextScale: 1,
+                    backTextScale: 1,
+                    frontTextOffsetX: 0,
+                    frontTextOffsetY: 0,
+                    backTextOffsetX: 0,
+                    backTextOffsetY: 0,
+                    textScale: 1,
+                    imageScale: 1,
+                    imageOffsetX: 0,
+                    imageOffsetY: 0,
+                    formattedQuestionHtml: qHtml,
+                    formattedAnswerHtml: aHtml,
+                    answerLegends: [],
+                    createdAt: new Date().toISOString(),
+                };
+            });
+
+            setLibrary((prev) => [...newCards, ...prev]);
+            showToast(`Importados ${newCards.length} flashcards!`, 'success');
+        } catch (e) {
+            console.error('Falha ao importar JSON:', e);
+            showToast('Não consegui ler esse JSON. Verifique se está válido.', 'error');
+        } finally {
+            setIsImportingJson(false);
+        }
     };
 
 
@@ -1472,15 +1572,75 @@ export default function App() {
                             </div>
                         </div>
 
-                        {/* 2. PLACEHOLDER PARA GEMINI IA */}
-                        <div className="flex-1 bg-slate-100 border-2 border-dashed border-slate-300 rounded-2xl p-8 flex flex-col items-center justify-center text-center opacity-70 hover:opacity-100 transition-opacity">
-                            <div className="bg-white p-3 rounded-full mb-3 shadow-sm">
-                                <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 text-indigo-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19.428 15.428a2 2 0 00-1.022-.547l-2.384-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z" />
-                                </svg>
+                        {/* 2. GEMINI (LINK) + IMPORTAÇÃO JSON (Q/A) */}
+                        <div className="flex-1 bg-white border border-slate-200 rounded-2xl p-6 md:p-7 flex flex-col gap-4 shadow-sm">
+                            <div className="flex items-start justify-between gap-3">
+                                <div className="flex items-center gap-3">
+                                    <div className="bg-indigo-50 text-indigo-600 p-2.5 rounded-xl">
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6l4 2" />
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                                        </svg>
+                                    </div>
+                                    <div>
+                                        <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">Gemini (atalho) + Importar JSON</span>
+                                        <p className="text-[11px] text-slate-500 mt-1 max-w-sm leading-snug">Abra seu link do Gemini e/ou envie um JSON com perguntas e respostas para gerar flashcards automaticamente.</p>
+                                    </div>
+                                </div>
+
+                                <a
+                                    href={GEMINI_SHARE_URL}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm shadow-lg shadow-indigo-500/20 transition"
+                                >
+                                    <span className="text-base">✨</span>
+                                    Abrir Gemini
+                                </a>
                             </div>
-                            <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">Integração Gemini AI</span>
-                            <p className="text-[10px] text-slate-400 mt-1 max-w-xs">Espaço reservado para o script de geração inteligente de conteúdo.</p>
+
+                            <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4">
+                                <div className="flex items-center justify-between gap-3 flex-wrap">
+                                    <div>
+                                        <div className="text-sm font-extrabold text-slate-800">Importar flashcards (JSON)</div>
+                                        <div className="text-[11px] text-slate-500">Aceita: array de objetos, ou mapa \"pergunta\": \"resposta\".</div>
+                                    </div>
+
+                                    <div className="flex items-center gap-2">
+                                        <input
+                                            id="import-json"
+                                            type="file"
+                                            accept="application/json,.json"
+                                            className="hidden"
+                                            onChange={async (e) => {
+                                                const f = e.target.files?.[0];
+                                                if (!f) return;
+                                                setImportJsonName(f.name);
+                                                await importFlashcardsFromJsonFile(f);
+                                                e.target.value = '';
+                                            }}
+                                        />
+                                        <label
+                                            htmlFor="import-json"
+                                            className={`inline-flex items-center gap-2 px-4 py-2 rounded-xl font-bold text-sm transition shadow-sm cursor-pointer ${isImportingJson ? 'bg-slate-200 text-slate-500 cursor-not-allowed' : 'bg-white border border-slate-300 hover:bg-slate-100 text-slate-700'}`}
+                                        >
+                                            {isImportingJson ? 'Importando…' : 'Enviar JSON'}
+                                        </label>
+                                    </div>
+                                </div>
+
+                                <div className="mt-3 text-[11px] text-slate-500">
+                                    <span className="font-bold">Arquivo:</span> {importJsonName || 'nenhum'}
+                                </div>
+
+                                <div className="mt-3">
+                                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-2">Exemplo</div>
+                                    <pre className="text-[11px] leading-relaxed bg-white border border-slate-200 rounded-xl p-3 overflow-auto">{`[
+  { "question": "O que é X?", "answer": "X é ...", "subject": "Matéria", "concept": "Conceito" },
+  { "question": "Como funciona Y?", "answer": "Y funciona ..." }
+]`}</pre>
+                                </div>
+                            </div>
                         </div>
 
                     </div>
