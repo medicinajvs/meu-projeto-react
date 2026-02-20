@@ -51,7 +51,7 @@ const Toast = ({ message, type, visible }) => (
 const ConfirmModal = ({ isOpen, message, onConfirm, onCancel }) => {
     if (!isOpen) return null;
     return (
-        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-[70] flex items-center justify-center p-4">
+        <div className="fixed inset-0 bg-medical-600 hover:bg-medical-700/50 backdrop-blur-sm z-[70] flex items-center justify-center p-4">
             <div className="bg-white rounded-2xl shadow-2xl p-6 max-w-sm w-full transform scale-100 transition-all">
                 <h3 className="text-lg font-bold text-slate-800 mb-2">Confirmação</h3>
                 <p className="text-slate-600 mb-6 text-sm">{message}</p>
@@ -111,12 +111,53 @@ export default function App() {
     });
     const [autoSync, setAutoSync] = useState(false);
 
+    // Opções de pastas (Matéria/Conceito) a partir do Acervo — Fase 3
+    const subjectOptions = useMemo(() => {
+        const set = new Set();
+        for (const c of library) {
+            const s = (c?.subject || '').toString().trim();
+            if (s) set.add(s);
+        }
+        return Array.from(set).sort((a, b) => a.localeCompare(b, 'pt-BR', { sensitivity: 'base' }));
+    }, [library]);
+
+    const conceptOptions = useMemo(() => {
+        const subj = (form.subject || '').toString().trim();
+        if (!subj) return [];
+        const set = new Set();
+        for (const c of library) {
+            const s = (c?.subject || '').toString().trim();
+            if (s !== subj) continue;
+            const k = (c?.concept || '').toString().trim();
+            if (k) set.add(k);
+        }
+        return Array.from(set).sort((a, b) => a.localeCompare(b, 'pt-BR', { sensitivity: 'base' }));
+    }, [library, form.subject]);
+
+
     // Preview panel state (arraste no verso)
     const previewDragRef = useRef({ dragging: false, startX: 0, startY: 0, baseX: 0, baseY: 0, imgId: null });
 
     const [searchTerm, setSearchTerm] = useState('');
     
-    // UI State
+    
+    // Study (Treino) Section State
+    const [isLearningModeModalOpen, setIsLearningModeModalOpen] = useState(false);
+    const [studyMode, setStudyMode] = useState('free'); // 'free' | 'spaced'
+    const [isStudyFiltersOpen, setIsStudyFiltersOpen] = useState(false);
+    const [studySubject, setStudySubject] = useState('');
+    const [studyConcept, setStudyConcept] = useState('');
+
+
+// Study Session (Fase 2)
+const [isStudySessionOpen, setIsStudySessionOpen] = useState(false);
+const [studyQueue, setStudyQueue] = useState([]);
+const [studyIndex, setStudyIndex] = useState(0);
+const [studyShowAnswer, setStudyShowAnswer] = useState(false);
+const [studyStats, setStudyStats] = useState({ correct: 0, wrong: 0, skipped: 0 });
+const [studySessionDateKey, setStudySessionDateKey] = useState('');
+
+// UI State
     const [expandedSubjects, setExpandedSubjects] = useState({});
     const [expandedConcepts, setExpandedConcepts] = useState({});
     
@@ -591,6 +632,35 @@ export default function App() {
         } catch (err) { if (!silent) showToast("Erro ao agendar", "error"); }
     };
 
+
+    // Agenda UMA revisão (SRS) no dia indicado (não remove eventos antigos — evita mexer no histórico do usuário)
+    const scheduleNextSrsReviewEvent = async (card, dateKey, silent = false) => {
+        if (!dateKey) return;
+        if (!window.gapi?.client?.getToken()) {
+            if (!silent) showToast("Conecte o Calendar primeiro", "error");
+            return;
+        }
+        try {
+            const dateStr = String(dateKey);
+            await window.gapi.client.calendar.events.insert({
+                'calendarId': 'primary',
+                'resource': {
+                    'summary': `🧠 Rev: ${card.concept} (${card.subject})`,
+                    'description': `SRS\nDUE ${dateStr}\n[CARD:${card.id}]\n\n[P] ${card.question}\n\n[R] ${card.answer}`,
+                    'start': { 'date': dateStr },
+                    'end': { 'date': dateStr },
+                    'transparency': 'transparent',
+                    'reminders': { 'useDefault': false, 'overrides': [{ 'method': 'popup', 'minutes': 540 }] }
+                }
+            });
+            if (!silent) showToast("Próxima revisão agendada!", "success");
+            await fetchMonthEvents();
+            fetchUpcomingEvents();
+        } catch (err) {
+            if (!silent) showToast("Erro ao agendar próxima revisão", "error");
+        }
+    };
+
     // --- IMPORTAÇÃO (JSON Q/A) ---
     const normalizeQaJson = (parsed) => {
         // Aceita formatos:
@@ -643,8 +713,10 @@ export default function App() {
                 return;
             }
 
-            const defaultSubject = (form.subject || 'Importado').trim();
-            const defaultConcept = (form.concept || 'Geral').trim();
+            const fileBaseRaw = (file?.name || '').replace(/\.[^.]+$/, '').trim();
+            const fileBase = fileBaseRaw.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+            const defaultSubject = (fileBase || 'Importado').trim();
+            const defaultConcept = 'Geral';
 
             const now = Date.now();
             const newCards = items.map((it, idx) => {
@@ -673,7 +745,14 @@ export default function App() {
                     formattedAnswerHtml: aHtml,
                     answerLegends: [],
                     createdAt: new Date().toISOString(),
-                };
+                // SRS (Fase 4) — estado inicial
+                srsEase: 2.5,
+                srsReps: 0,
+                srsInterval: 0,
+                srsDue: new Date().toISOString().split('T')[0], // hoje (entra em revisão já no modo espaçado, se aplicável)
+                srsLast: null,
+                studyHistory: [],
+            };
             });
 
             setLibrary((prev) => [...newCards, ...prev]);
@@ -931,8 +1010,269 @@ export default function App() {
         return tree;
     }, [library, searchTerm]);
 
+
+    
+// Derived state for Study (Treino) Section
+const parseRevSummary = (summary = '') => {
+    // Esperado: "🧠 Rev: CONCEITO (MATÉRIA)"
+    const clean = String(summary).replace(/^🧠\s*/,'').trim();
+    const m = clean.match(/Rev:\s*(.*?)\s*\((.*?)\)\s*$/i);
+    if (!m) return null;
+    return { concept: (m[1] || '').trim(), subject: (m[2] || '').trim() };
+};
+
+const getActiveStudyDateKey = () => {
+    // Em modo espaçado usamos (1) dia selecionado no calendário, senão (2) hoje
+    if (studyMode === 'spaced' && selectedCalDay) {
+        const y = calDate.getFullYear();
+        const m = calDate.getMonth();
+        return new Date(y, m, selectedCalDay).toISOString().split('T')[0];
+    }
+    return new Date().toISOString().split('T')[0];
+};
+
+// SRS helpers (Fase 4)
+const addDaysToDateKey = (dateKey, days) => {
+    const [y, m, d] = String(dateKey || '').split('-').map(n => parseInt(n, 10));
+    if (!y || !m || !d) return new Date().toISOString().split('T')[0];
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() + (Number(days) || 0));
+    return dt.toISOString().split('T')[0];
+};
+
+const isDueOnOrBefore = (dueKey, targetKey) => {
+    if (!dueKey) return true; // sem due -> considera devido
+    return String(dueKey) <= String(targetKey);
+};
+
+const computeNextSrs = (card, result, todayKey, quality = null) => {
+    const ease0 = Number(card?.srsEase ?? 2.5) || 2.5;
+    const reps0 = Number(card?.srsReps ?? 0) || 0;
+    const interval0 = Number(card?.srsInterval ?? 0) || 0;
+
+    // Resultados: correct | wrong | skipped
+    if (result === 'skipped') {
+        // Não altera o agendamento; mantém due atual
+        return {
+            srsEase: ease0,
+            srsReps: reps0,
+            srsInterval: interval0,
+            srsDue: card?.srsDue || todayKey,
+        };
+    }
+
+    if (result === 'wrong') {
+        const ease = Math.max(1.3, ease0 - 0.2);
+        const reps = 0;
+        const interval = 1;
+        const due = addDaysToDateKey(todayKey, 1);
+        return { srsEase: ease, srsReps: reps, srsInterval: interval, srsDue: due };
+    }
+
+    // correct
+    const reps = reps0 + 1;
+    // quality (1-4): 1=errei (não chega aqui), 2=difícil, 3=médio, 4=fácil
+    let delta = 0.10;
+    if (quality === 2) delta = -0.05;
+    if (quality === 3) delta = 0.10;
+    if (quality === 4) delta = 0.15;
+    const ease = Math.max(1.3, ease0 + delta);
+    let interval;
+    if (reps0 <= 0) interval = 1;
+    else if (reps0 === 1) interval = 3;
+    else interval = Math.max(1, Math.round((interval0 || 3) * ease));
+    const due = addDaysToDateKey(todayKey, interval);
+    return { srsEase: ease, srsReps: reps, srsInterval: interval, srsDue: due };
+};
+
+
+const freeDeck = useMemo(() => {
+    if (!studySubject) return [];
+    return library.filter(card => {
+        const normKey = (v) => (v ?? '').toString().trim().toLowerCase();
+        const sameSubject = normKey(card.subject) === normKey(studySubject);
+        const sameConcept = studyConcept ? normKey(card.concept) === normKey(studyConcept) : true;
+        return sameSubject && sameConcept;
+    });
+}, [library, studySubject, studyConcept]);
+
+const spacedDeck = useMemo(() => {
+    const dateKey = getActiveStudyDateKey();
+    const events = calEvents?.[dateKey] || [];
+
+    // Se houver eventos Rev no dia, usamos isso como "fonte de verdade" do que é para revisar.
+    // Se não houver, caímos para SRS puro (cards vencidos / devidos no dia), opcionalmente filtrados por Matéria/Conceito.
+    const wanted = new Map(); // key => true (subject|||concept)
+    for (const ev of events) {
+        const parsed = parseRevSummary(ev?.summary || '');
+        if (!parsed) continue;
+        const k = `${parsed.subject.toLowerCase()}|||${parsed.concept.toLowerCase()}`;
+        wanted.set(k, true);
+    }
+
+    const deck = library.filter(card => {
+        const cardSubject = String(card.subject || '');
+        const cardConcept = String(card.concept || '');
+
+        // 1) Se houver wanted (Calendar), precisa casar
+        if (wanted.size > 0) {
+            const k = `${cardSubject.toLowerCase()}|||${cardConcept.toLowerCase()}`;
+            if (!wanted.has(k)) return false;
+        }
+
+        // 2) Filtro manual opcional (refino)
+        const normKey = (v) => (v ?? '').toString().trim().toLowerCase();
+        const sameSubject = studySubject ? (normKey(cardSubject) === normKey(studySubject)) : true;
+        const sameConcept = studyConcept ? (normKey(cardConcept) === normKey(studyConcept)) : true;
+        if (!(sameSubject && sameConcept)) return false;
+
+        // 3) SRS: só entra se estiver devido no dia (ou vencido)
+        return isDueOnOrBefore(card?.srsDue, dateKey);
+    });
+
+    // Remove duplicados por id (segurança)
+    const seen = new Set();
+    return deck.filter(c => (seen.has(c.id) ? false : (seen.add(c.id), true)));
+}, [library, calEvents, calDate, selectedCalDay, studySubject, studyConcept, studyMode]);
+
+const studyFlashcards = useMemo(() => {
+    return studyMode === 'spaced' ? spacedDeck : freeDeck;
+}, [studyMode, spacedDeck, freeDeck]);
+const studyConceptsForSubject = useMemo(() => {
+        if (!studySubject) return [];
+        const conceptsObj = libraryTree[studySubject] || {};
+        return Object.keys(conceptsObj);
+    }, [libraryTree, studySubject]);
+
     const toggleSubject = (s) => setExpandedSubjects(prev => ({ ...prev, [s]: !prev[s] }));
     const toggleConcept = (c) => setExpandedConcepts(prev => ({ ...prev, [c]: !prev[c] }));
+
+const shuffleArray = (arr) => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+};
+
+const startStudySession = () => {
+    const deck = Array.isArray(studyFlashcards) ? studyFlashcards : [];
+    if (!deck.length) {
+        if (studyMode === 'spaced') {
+            showToast('Nenhuma revisão encontrada para este dia.', 'error');
+        } else {
+            showToast('Selecione uma Matéria (e opcionalmente um Conceito).', 'error');
+        }
+        return;
+    }
+    const dateKey = getActiveStudyDateKey();
+    setStudySessionDateKey(dateKey);
+    setStudyQueue(shuffleArray(deck));
+    setStudyIndex(0);
+    setStudyShowAnswer(false);
+    setStudyStats({ correct: 0, wrong: 0, skipped: 0 });
+    setIsStudySessionOpen(true);
+};
+
+const updateStudyResult = (cardId, result, quality = null) => {
+    const nowIso = new Date().toISOString();
+    const todayKey = (studySessionDateKey || nowIso.split('T')[0]);
+
+    // SRS: calcula próximo agendamento a partir do estado atual do card
+    const current = library.find(c => c.id === cardId);
+    const nextSrs = computeNextSrs(current || {}, result, todayKey, quality);
+
+    setLibrary(prev => prev.map(c => {
+        if (c.id !== cardId) return c;
+
+        const total = (c.studyTotalReviews || 0) + 1;
+        const correct = (c.studyCorrectReviews || 0) + (result === 'correct' ? 1 : 0);
+        const wrong = (c.studyWrongReviews || 0) + (result === 'wrong' ? 1 : 0);
+
+        const history = Array.isArray(c.studyHistory) ? [...c.studyHistory] : [];
+        history.unshift({ dateKey: todayKey, result, quality: quality ?? null });
+        if (history.length > 40) history.length = 40;
+
+        return {
+            ...c,
+            lastStudiedAt: nowIso,
+            lastStudiedDateKey: todayKey,
+            lastStudyResult: result,
+            studyTotalReviews: total,
+            studyCorrectReviews: correct,
+            studyWrongReviews: wrong,
+
+            // SRS fields
+            srsEase: nextSrs.srsEase,
+            srsReps: nextSrs.srsReps,
+            srsInterval: nextSrs.srsInterval,
+            srsDue: nextSrs.srsDue,
+            srsLast: todayKey,
+            studyHistory: history,
+        };
+    }));
+
+    // Se estiver em auto-sync, agenda apenas a PRÓXIMA revisão (SRS) no Calendar
+    if (autoSync && user && result !== 'skipped') {
+        try {
+            const cardForEvent = current || library.find(c => c.id === cardId);
+            if (cardForEvent) {
+                scheduleNextSrsReviewEvent({ ...cardForEvent, ...nextSrs }, nextSrs.srsDue, true);
+            }
+        } catch (e) {
+            // silencioso
+        }
+    }
+};
+
+
+const goNextStudyCard = () => {
+    setStudyShowAnswer(false);
+    setStudyIndex((prev) => {
+        const next = prev + 1;
+        return next;
+    });
+};
+
+
+const handleStudyGrade = (grade) => {
+    // grade: 1=Errei, 2=Difícil, 3=Médio, 4=Fácil
+    const card = studyQueue[studyIndex];
+    if (!card) return;
+
+    if (grade === 1) {
+        setStudyStats(s => ({ ...s, wrong: s.wrong + 1 }));
+        updateStudyResult(card.id, 'wrong', 1);
+        goNextStudyCard();
+        return;
+    }
+
+    // grades 2-4 contam como acerto (com intervalos diferentes via quality)
+    setStudyStats(s => ({ ...s, correct: s.correct + 1 }));
+    updateStudyResult(card.id, 'correct', grade);
+    goNextStudyCard();
+};
+
+const handleStudyAction = (action) => {
+    const card = studyQueue[studyIndex];
+    if (!card) return;
+    if (action === 'correct') {
+        setStudyStats(s => ({ ...s, correct: s.correct + 1 }));
+        updateStudyResult(card.id, 'correct');
+        goNextStudyCard();
+    } else if (action === 'wrong') {
+        setStudyStats(s => ({ ...s, wrong: s.wrong + 1 }));
+        updateStudyResult(card.id, 'wrong');
+        goNextStudyCard();
+    } else {
+        setStudyStats(s => ({ ...s, skipped: s.skipped + 1 }));
+        updateStudyResult(card.id, 'skipped');
+        goNextStudyCard();
+    }
+};
+
+
 
 
     // --- PREVIEW & DOWNLOAD ---
@@ -1131,24 +1471,62 @@ export default function App() {
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-5">
                             <div className="space-y-1.5">
-                                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Matéria</label>
-                                <input 
-                                    type="text" 
+                                <div className="flex items-center justify-between gap-2">
+                                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Matéria</label>
+                                    <button
+                                        type="button"
+                                        onClick={() => setForm((prev) => ({ ...prev, subject: '' }))}
+                                        className="text-[10px] font-extrabold px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-600"
+                                        title="Limpar"
+                                    >
+                                        Limpar
+                                    </button>
+                                </div>
+                                <input
+                                    type="text"
                                     value={form.subject}
-                                    onChange={(e) => setForm({...form, subject: e.target.value})}
-                                    className="input-field w-full p-3 rounded-xl text-sm font-semibold text-slate-800 bg-white placeholder:text-slate-400 placeholder:font-normal border border-slate-300 focus:border-medical-500 focus:ring-2 focus:ring-medical-500/20 focus:outline-none transition-all" 
-                                    placeholder="Ex: Cardiologia" 
+                                    list="subject-options"
+                                    onChange={(e) => {
+                                        const v = e.target.value;
+                                        setForm((prev) => ({ ...prev, subject: v, concept: prev.concept }));
+                                    }}
+                                    className="input-field w-full p-3 rounded-xl text-sm font-semibold text-slate-800 bg-white placeholder:text-slate-400 placeholder:font-normal border border-slate-300 focus:border-medical-500 focus:ring-2 focus:ring-medical-500/20 focus:outline-none transition-all"
+                                    placeholder="Ex: Cardiologia"
                                 />
+                                <datalist id="subject-options">
+                                    {subjectOptions.map((s) => (<option key={s} value={s} />))}
+                                </datalist>
+                                <div className="text-[11px] text-slate-500 mt-1">
+                                    Dica: digite ou selecione uma Matéria existente (baseada no Acervo).
+                                </div>
                             </div>
+
                             <div className="space-y-1.5">
-                                <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Conceito</label>
-                                <input 
-                                    type="text" 
+                                <div className="flex items-center justify-between gap-2">
+                                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider pl-1">Conceito</label>
+                                    <button
+                                        type="button"
+                                        onClick={() => setForm((prev) => ({ ...prev, concept: 'Geral' }))}
+                                        className="text-[10px] font-extrabold px-2 py-1 rounded-lg border border-slate-200 bg-white hover:bg-slate-100 text-slate-600"
+                                        title="Definir como Geral"
+                                    >
+                                        Geral
+                                    </button>
+                                </div>
+                                <input
+                                    type="text"
                                     value={form.concept}
-                                    onChange={(e) => setForm({...form, concept: e.target.value})}
-                                    className="input-field w-full p-3 rounded-xl text-sm font-semibold text-slate-800 bg-white placeholder:text-slate-400 placeholder:font-normal border border-slate-300 focus:border-medical-500 focus:ring-2 focus:ring-medical-500/20 focus:outline-none transition-all" 
-                                    placeholder="Ex: IAM" 
+                                    list="concept-options"
+                                    onChange={(e) => setForm({ ...form, concept: e.target.value })}
+                                    className="input-field w-full p-3 rounded-xl text-sm font-semibold text-slate-800 bg-white placeholder:text-slate-400 placeholder:font-normal border border-slate-300 focus:border-medical-500 focus:ring-2 focus:ring-medical-500/20 focus:outline-none transition-all"
+                                    placeholder="Ex: IAM"
                                 />
+                                <datalist id="concept-options">
+                                    {conceptOptions.map((c) => (<option key={c} value={c} />))}
+                                </datalist>
+                                <div className="text-[11px] text-slate-500 mt-1">
+                                    Dica: conceitos sugeridos variam conforme a Matéria.
+                                </div>
                             </div>
                         </div>
 
@@ -1507,7 +1885,7 @@ export default function App() {
                                         </div>
 
                                         <div className="mt-4 flex gap-2">
-                                            <button onClick={() => handleDownload('live-front', `${(form.concept || 'CARD')}_F`)} className="flex-1 bg-slate-800 text-white py-3 rounded-xl font-bold hover:bg-slate-900 transition text-sm">⬇ Baixar Frente</button>
+                                            <button onClick={() => handleDownload('live-front', `${(form.concept || 'CARD')}_F`)} className="flex-1 bg-slate-800 text-white py-3 rounded-xl font-bold hover:bg-medical-600 hover:bg-medical-700 transition text-sm">⬇ Baixar Frente</button>
                                         </div>
                                     </div>
 
@@ -1561,7 +1939,7 @@ export default function App() {
                                         </div>
 
                                         <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                                            <button onClick={() => handleDownload('live-back', `${(form.concept || 'CARD')}_V`)} className="bg-slate-800 text-white py-3 rounded-xl font-bold hover:bg-slate-900 transition text-sm sm:col-span-2">⬇ Baixar Verso</button>
+                                            <button onClick={() => handleDownload('live-back', `${(form.concept || 'CARD')}_V`)} className="bg-slate-800 text-white py-3 rounded-xl font-bold hover:bg-medical-600 hover:bg-medical-700 transition text-sm sm:col-span-2">⬇ Baixar Verso</button>
                                         </div>
 
                                         <div className="mt-4 mx-auto w-full max-w-sm text-[11px] text-slate-500 bg-white border border-slate-200 rounded-2xl p-3 leading-relaxed text-center shadow-sm">
@@ -1616,6 +1994,8 @@ export default function App() {
                                                 const f = e.target.files?.[0];
                                                 if (!f) return;
                                                 setImportJsonName(f.name);
+                                                const base = f.name.replace(/\.[^.]+$/, '').trim();
+                                                setForm(prev => ({ ...prev, subject: (prev.subject && prev.subject !== 'Importado') ? prev.subject : (base || prev.subject) }));
                                                 await importFlashcardsFromJsonFile(f);
                                                 e.target.value = '';
                                             }}
@@ -1648,6 +2028,512 @@ export default function App() {
 
                 </div>
             
+
+            {/* ESTUDO (NOVO) */}
+            <div className="mb-8">
+                <div className="glass-panel rounded-3xl shadow-xl shadow-slate-200/50 overflow-hidden w-full">
+                    <div className="p-4 md:p-5 border-b border-slate-200 bg-white/60 backdrop-blur-sm">
+                        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                            <div>
+                                <h2 className="text-lg font-bold text-slate-800 flex items-center gap-2">
+                                    <span className="bg-amber-100 text-amber-700 p-1.5 rounded-lg">🧠</span> Estudo
+                                </h2>
+                                <p className="text-[10px] text-slate-500 mt-0.5 font-medium uppercase tracking-wide">
+                                    Modo livre ou revisão espaçada • Filtre por Matéria &gt; Conceito
+                                </p>
+                            </div>
+
+                            <div className="flex flex-wrap gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => setIsLearningModeModalOpen(true)}
+                                    className="text-xs px-3 py-2 rounded-xl font-extrabold transition border bg-medical-600 text-white border-slate-900 hover:bg-medical-700"
+                                >
+                                    Modo: {studyMode === 'free' ? 'Treino livre' : 'Revisão espaçada'}
+                                </button>
+
+                                <button
+                                    type="button"
+                                    onClick={() => setIsStudyFiltersOpen(true)}
+                                    className="text-xs px-3 py-2 rounded-xl font-extrabold transition border bg-white text-slate-800 border-slate-200 hover:bg-slate-50"
+                                >
+                                    Escolher temas
+                                </button>
+                            </div>
+                        </div>
+
+                        {studySubject && (
+                            <div className="mt-4 flex flex-wrap items-center gap-2">
+                                <span className="text-[11px] font-bold text-slate-600">Selecionado:</span>
+                                <span className="text-[11px] font-extrabold px-2.5 py-1 rounded-full bg-medical-600 text-white">
+                                    {studySubject}
+                                </span>
+                                {studyConcept && (
+                                    <span className="text-[11px] font-extrabold px-2.5 py-1 rounded-full bg-white border border-slate-200 text-slate-800">
+                                        {studyConcept}
+                                    </span>
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={() => { setStudySubject(''); setStudyConcept(''); }}
+                                    className="text-[11px] font-bold text-red-600 hover:text-red-700 underline underline-offset-2 ml-1"
+                                >
+                                    Limpar
+                                </button>
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="p-4 md:p-5 bg-slate-50/50">
+                        {!studySubject ? (
+                            <div className="flex flex-col items-center justify-center py-10 text-slate-400">
+                                <div className="text-3xl mb-2">📌</div>
+                                <p className="text-sm font-bold">Escolha uma Matéria para começar</p>
+                                <p className="text-xs mt-1">Clique em “Escolher temas” e selecione uma pasta do seu Acervo.</p>
+                            </div>
+                        ) : (
+                            <div className="space-y-4">
+                                <div className="flex items-center justify-between gap-3">
+                                    <div>
+                                        <p className="text-sm font-extrabold text-slate-800">Flashcards para estudar</p>
+                                        <p className="text-xs text-slate-500">
+                                            {studyFlashcards.length} card{studyFlashcards.length === 1 ? '' : 's'} encontrado{studyFlashcards.length === 1 ? '' : 's'}
+                                        </p>
+                                    </div>
+
+                                    <button
+                                        type="button"
+                                        className="text-xs px-3 py-2 rounded-xl font-extrabold transition border bg-amber-600 text-white border-amber-600 hover:bg-amber-700"
+                                        onClick={() => {
+                                            // Fase 1: apenas UI + filtro. Modo de estudo será conectado na próxima fase.
+                                            startStudySession();
+                                        }}
+                                    >
+                                        Iniciar estudo
+                                    </button>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                                    {studyFlashcards.slice(0, 8).map((card) => (
+                                        <div key={card.id} className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm">
+                                            <p className="text-[11px] font-bold text-slate-500 uppercase tracking-wide">
+                                                {card.subject} • {card.concept}
+                                            </p>
+                                            <p className="mt-2 text-sm font-extrabold text-slate-800 line-clamp-3">
+                                                {card.question}
+                                            </p>
+                                            <p className="mt-2 text-xs text-slate-500 line-clamp-2">
+                                                {card.answer}
+                                            </p>
+                                        </div>
+                                    ))}
+                                </div>
+
+                                {studyFlashcards.length > 8 && (
+                                    <p className="text-xs text-slate-500">
+                                        Mostrando 8 de {studyFlashcards.length}. Use o botão acima para iniciar o modo de estudo.
+                                    </p>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </div>
+
+            {/* MODAL: MODO DE APRENDIZADO (UI baseada no index.html) */}
+            {isLearningModeModalOpen && (
+                <div className="fixed inset-0 bg-medical-600 hover:bg-medical-700/70 flex items-center justify-center p-4 z-50">
+                    <div className="bg-[#1E1E1E] border border-[#2D2D2D] rounded-2xl p-6 md:p-8 w-full max-w-lg relative text-white">
+                        <button
+                            onClick={() => setIsLearningModeModalOpen(false)}
+                            className="absolute top-5 right-5 text-gray-400 hover:text-white"
+                            aria-label="Fechar"
+                            type="button"
+                        >
+                            ✕
+                        </button>
+
+                        <h2 className="text-2xl font-extrabold mb-6">Modo de aprendizado</h2>
+
+                        <div className="space-y-4">
+                            <button
+                                type="button"
+                                onClick={() => { setStudyMode('spaced'); setIsLearningModeModalOpen(false); }}
+                                className={`w-full text-left border rounded-xl p-5 flex gap-4 items-start transition ${
+                                    studyMode === 'spaced' ? 'border-[#D98E73] bg-white/5' : 'border-gray-700 hover:bg-white/5'
+                                }`}
+                            >
+                                <div className="bg-[#D98E73] bg-opacity-20 text-[#D98E73] rounded-lg p-3">⟳</div>
+                                <div className="flex-1">
+                                    <div className="flex justify-between items-center">
+                                        <h3 className="font-extrabold text-lg">Revisão espaçada</h3>
+                                        <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center ${
+                                            studyMode === 'spaced' ? 'border-[#D98E73]' : 'border-gray-500'
+                                        }`}>
+                                            {studyMode === 'spaced' ? <span className="text-[#D98E73] text-sm">●</span> : null}
+                                        </div>
+                                    </div>
+                                    <p className="text-gray-400 mt-2 text-sm leading-relaxed">
+                                        (Fase 2) Sincronizado com o calendário para revisar no momento certo.
+                                    </p>
+                                </div>
+                            </button>
+
+                            <button
+                                type="button"
+                                onClick={() => { setStudyMode('free'); setIsLearningModeModalOpen(false); }}
+                                className={`w-full text-left border rounded-xl p-5 flex gap-4 items-start transition ${
+                                    studyMode === 'free' ? 'border-[#D98E73] bg-white/5' : 'border-gray-700 hover:bg-white/5'
+                                }`}
+                            >
+                                <div className="bg-[#D98E73] bg-opacity-20 text-[#D98E73] rounded-lg p-3">⚡</div>
+                                <div className="flex-1">
+                                    <div className="flex justify-between items-center">
+                                        <h3 className="font-extrabold text-lg">Treino livre</h3>
+                                        <div className={`w-6 h-6 rounded-full border-2 flex items-center justify-center ${
+                                            studyMode === 'free' ? 'border-[#D98E73]' : 'border-gray-500'
+                                        }`}>
+                                            {studyMode === 'free' ? <span className="text-[#D98E73] text-sm">●</span> : null}
+                                        </div>
+                                    </div>
+                                    <p className="text-gray-400 mt-2 text-sm leading-relaxed">
+                                        Você escolhe os temas que quer revisar, no seu ritmo.
+                                    </p>
+                                </div>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* MODAL: FILTROS (Matéria &gt; Conceito) */}
+            {isStudyFiltersOpen && (
+                <div className="fixed inset-0 bg-medical-600 hover:bg-medical-700/70 flex items-center justify-center p-4 z-50">
+                    <div className="bg-white rounded-3xl w-full max-w-4xl shadow-2xl overflow-hidden border border-slate-200">
+                        <div className="p-4 md:p-5 border-b border-slate-200 flex items-center justify-between bg-slate-50">
+                            <div>
+                                <p className="text-sm font-extrabold text-slate-800">Selecionar temas</p>
+                                <p className="text-xs text-slate-500">Baseado nas pastas e subpastas do seu Acervo</p>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setIsStudyFiltersOpen(false)}
+                                className="text-xs px-3 py-2 rounded-xl font-extrabold transition border bg-medical-600 text-white border-slate-900 hover:bg-medical-700"
+                            >
+                                Fechar
+                            </button>
+                        </div>
+
+                        <div className="p-4 md:p-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 max-h-[60vh] overflow-y-auto custom-scroll">
+                                <p className="text-xs font-extrabold text-slate-700 mb-3">Matérias</p>
+                                {Object.keys(libraryTree).length === 0 ? (
+                                    <p className="text-sm text-slate-500">Seu acervo está vazio.</p>
+                                ) : (
+                                    <div className="space-y-1">
+                                        {Object.keys(libraryTree).sort().map((subject) => (
+                                            <button
+                                                key={subject}
+                                                type="button"
+                                                onClick={() => { setStudySubject(subject); setStudyConcept(''); }}
+                                                className={`w-full text-left px-3 py-2 rounded-xl text-sm font-bold transition border ${
+                                                    studySubject === subject
+                                                        ? 'bg-medical-600 text-white border-slate-900'
+                                                        : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-100'
+                                                }`}
+                                            >
+                                                {subject}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+
+                            <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 max-h-[60vh] overflow-y-auto custom-scroll">
+                                <p className="text-xs font-extrabold text-slate-700 mb-3">Conceitos</p>
+                                {!studySubject ? (
+                                    <p className="text-sm text-slate-500">Selecione uma matéria para ver os conceitos.</p>
+                                ) : (
+                                    <div className="space-y-1">
+                                        <button
+                                            type="button"
+                                            onClick={() => setStudyConcept('')}
+                                            className={`w-full text-left px-3 py-2 rounded-xl text-sm font-bold transition border ${
+                                                studyConcept === ''
+                                                    ? 'bg-medical-600 text-white border-slate-900'
+                                                    : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-100'
+                                            }`}
+                                        >
+                                            Todos
+                                        </button>
+
+                                        {studyConceptsForSubject.sort().map((concept) => (
+                                            <button
+                                                key={concept}
+                                                type="button"
+                                                onClick={() => setStudyConcept(concept)}
+                                                className={`w-full text-left px-3 py-2 rounded-xl text-sm font-bold transition border ${
+                                                    studyConcept === concept
+                                                        ? 'bg-medical-600 text-white border-slate-900'
+                                                        : 'bg-white text-slate-800 border-slate-200 hover:bg-slate-100'
+                                                }`}
+                                            >
+                                                {concept}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+
+                                <div className="mt-4">
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsStudyFiltersOpen(false)}
+                                        className="w-full text-xs px-3 py-2 rounded-xl font-extrabold transition border bg-amber-600 text-white border-amber-600 hover:bg-amber-700 disabled:opacity-50"
+                                        disabled={!studySubject}
+                                    >
+                                        Aplicar
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+{/* MODAL: Sessão de Estudo */}
+{isStudySessionOpen && (
+    <div className="fixed inset-0 bg-white/80 backdrop-blur-md z-[95] flex items-center justify-center p-4">
+        <div className="bg-white rounded-[1.5rem] md:rounded-[2rem] max-w-3xl w-full overflow-hidden shadow-2xl ring-1 ring-white/20">
+            {(() => {
+                const total = studyQueue.length;
+                const isDone = studyIndex >= total;
+                const card = isDone ? null : studyQueue[studyIndex];
+                const modeLabel = studyMode === 'spaced' ? 'Revisão espaçada' : 'Treino livre';
+                const dateLabel = studyMode === 'spaced' ? (studySessionDateKey || getActiveStudyDateKey()) : '';
+                return (
+                    <>
+                        <div className="px-5 py-4 md:px-7 md:py-5 border-b border-slate-100 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-white">
+                            <div>
+                                <div className="flex items-center gap-2">
+                                    <span className="inline-flex items-center px-2 py-1 rounded-lg text-[11px] font-extrabold bg-medical-600 text-white">
+                                        {modeLabel}
+                                    </span>
+                                    {dateLabel && (
+                                        <span className="inline-flex items-center px-2 py-1 rounded-lg text-[11px] font-extrabold bg-slate-100 text-slate-700 border border-slate-200">
+                                            Dia: {dateLabel}
+                                        </span>
+                                    )}
+                                </div>
+                                <div className="mt-1 text-xs text-slate-500 font-semibold">
+                                    {isDone ? 'Sessão concluída' : `Card ${studyIndex + 1} de ${total}`}
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => setIsStudySessionOpen(false)}
+                                className="self-start sm:self-auto px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-extrabold text-xs"
+                                title="Fechar"
+                            >
+                                Fechar
+                            </button>
+                        </div>
+
+                        {/* Conteúdo */}
+                        <div className="p-6 md:p-8 bg-white">
+                            {!isDone ? (
+                                <div className="flex flex-col items-center">
+                                    {/* Progresso */}
+                                    <div className="w-full max-w-5xl">
+                                        <div className="flex items-center justify-between text-xs font-bold text-slate-500">
+                                            <span>Cards</span>
+                                            <span>{studyIndex + 1}/{total}</span>
+                                        </div>
+                                        <div className="mt-2 h-2 rounded-full bg-slate-200 overflow-hidden">
+                                            <div
+                                                className="h-full bg-medical-600"
+                                                style={{ width: `${Math.round(((studyIndex + 1) / Math.max(1, total)) * 100)}%` }}
+                                            />
+                                        </div>
+                                    </div>
+
+                                    {/* Cards */}
+                                    <div className="mt-8 w-full max-w-6xl flex items-center justify-center gap-6">
+                                        {/* Anterior */}
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setStudyShowAnswer(false);
+                                                setStudyIndex(i => Math.max(0, i - 1));
+                                            }}
+                                            disabled={studyIndex <= 0}
+                                            className="hidden sm:inline-flex h-12 w-12 items-center justify-center rounded-full bg-white border border-slate-200 text-slate-700 font-extrabold shadow hover:bg-slate-50 disabled:opacity-30 disabled:cursor-not-allowed"
+                                            title="Anterior"
+                                        >
+                                            ‹
+                                        </button>
+
+                                        <div className={`flex ${studyShowAnswer ? 'flex-col md:flex-row' : 'flex-col'} items-center justify-center gap-6 w-full`}>
+                                            {/* Frente */}
+                                            <div
+                                                className="w-[280px] h-[420px] sm:w-[340px] sm:h-[500px] rounded-[2rem] overflow-hidden shadow-2xl relative"
+                                                style={{
+                                                    backgroundImage: `url(${frontBgBase64})`,
+                                                    backgroundSize: 'cover',
+                                                    backgroundPosition: 'center',
+                                                }}
+                                            >
+                                                <div className="absolute inset-0 bg-black/25" />
+                                                <div className="absolute inset-0 flex items-center justify-center p-8">
+                                                    <div className="text-center text-white font-extrabold text-xl sm:text-2xl leading-snug drop-shadow-[0_6px_18px_rgba(0,0,0,0.55)] whitespace-pre-wrap">
+                                                        {card?.question}
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            {/* Verso */}
+                                            {studyShowAnswer && (
+                                                <div
+                                                    className="w-[280px] h-[420px] sm:w-[340px] sm:h-[500px] rounded-[2rem] overflow-hidden shadow-2xl relative"
+                                                    style={{
+                                                        backgroundImage: `url(${backBgBase64})`,
+                                                        backgroundSize: 'cover',
+                                                        backgroundPosition: 'center',
+                                                    }}
+                                                >
+                                                    <div className="absolute inset-0 bg-black/10" />
+                                                    <div className="absolute inset-0 p-6 flex flex-col">
+                                                        {(card?.imageUrl || card?.image) && (
+                                                            <div className="flex-1 flex items-center justify-center">
+                                                                <img
+                                                                    src={card?.image || card?.imageUrl}
+                                                                    alt="Ilustração"
+                                                                    className="max-h-[55%] max-w-full object-contain rounded-2xl shadow-lg"
+                                                                />
+                                                            </div>
+                                                        )}
+
+                                                        <div className="mt-3 text-white text-sm sm:text-base font-semibold whitespace-pre-wrap drop-shadow-[0_4px_12px_rgba(0,0,0,0.45)]">
+                                                            {card?.answer}
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {/* Próximo */}
+                                        <button
+                                            type="button"
+                                            onClick={() => {
+                                                setStudyShowAnswer(false);
+                                                setStudyIndex(i => Math.min(total - 1, i + 1));
+                                            }}
+                                            disabled={studyIndex >= total - 1}
+                                            className="hidden sm:inline-flex h-12 w-12 items-center justify-center rounded-full bg-white border border-slate-200 text-slate-700 font-extrabold shadow hover:bg-slate-50 disabled:opacity-30 disabled:cursor-not-allowed"
+                                            title="Próximo"
+                                        >
+                                            ›
+                                        </button>
+                                    </div>
+
+                                    {/* Ações */}
+                                    {!studyShowAnswer ? (
+                                        <button
+                                            type="button"
+                                            onClick={() => setStudyShowAnswer(true)}
+                                            className="mt-8 px-7 py-3 rounded-2xl bg-medical-600 hover:bg-medical-700 text-white font-extrabold shadow-lg shadow-slate-900/15"
+                                        >
+                                            Revelar resposta
+                                        </button>
+                                    ) : (
+                                        <div className="mt-8 w-full max-w-4xl">
+                                            <div className="text-center text-sm font-extrabold text-slate-700">
+                                                O quanto você sabia deste card?
+                                            </div>
+                                            <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleStudyGrade(1)}
+                                                    className="rounded-2xl border border-purple-200 bg-purple-50 hover:bg-purple-100 px-4 py-4 text-center"
+                                                >
+                                                    <div className="text-2xl font-extrabold text-purple-700">1</div>
+                                                    <div className="mt-1 text-xs font-extrabold text-purple-700">Errei</div>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleStudyGrade(2)}
+                                                    className="rounded-2xl border border-orange-200 bg-orange-50 hover:bg-orange-100 px-4 py-4 text-center"
+                                                >
+                                                    <div className="text-2xl font-extrabold text-orange-700">2</div>
+                                                    <div className="mt-1 text-xs font-extrabold text-orange-700">Difícil</div>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleStudyGrade(3)}
+                                                    className="rounded-2xl border border-amber-200 bg-amber-50 hover:bg-amber-100 px-4 py-4 text-center"
+                                                >
+                                                    <div className="text-2xl font-extrabold text-amber-700">3</div>
+                                                    <div className="mt-1 text-xs font-extrabold text-amber-700">Médio</div>
+                                                </button>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleStudyGrade(4)}
+                                                    className="rounded-2xl border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 px-4 py-4 text-center"
+                                                >
+                                                    <div className="text-2xl font-extrabold text-emerald-700">4</div>
+                                                    <div className="mt-1 text-xs font-extrabold text-emerald-700">Fácil</div>
+                                                </button>
+                                            </div>
+
+                                            <div className="mt-4 flex items-center justify-center">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => handleStudyAction('skipped')}
+                                                    className="px-5 py-2.5 rounded-2xl bg-slate-100 hover:bg-slate-200 text-slate-800 font-extrabold"
+                                                >
+                                                    Pular
+                                                </button>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* Placar */}
+                                    <div className="mt-6 w-full max-w-5xl rounded-2xl bg-white border border-slate-200 p-4">
+                                        <div className="flex flex-wrap items-center gap-2 justify-center">
+                                            <span className="text-xs font-extrabold text-slate-700">Placar:</span>
+                                            <span className="text-xs font-extrabold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-1 rounded-lg">Acertos: {studyStats.correct}</span>
+                                            <span className="text-xs font-extrabold text-red-700 bg-red-50 border border-red-100 px-2 py-1 rounded-lg">Erros: {studyStats.wrong}</span>
+                                            <span className="text-xs font-extrabold text-slate-700 bg-slate-100 border border-slate-200 px-2 py-1 rounded-lg">Pulos: {studyStats.skipped}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="text-center py-10">
+                                    <div className="text-lg font-extrabold text-slate-800">Sessão concluída 🎉</div>
+                                    <div className="mt-2 text-sm text-slate-600 font-semibold">
+                                        Acertos: {studyStats.correct} · Erros: {studyStats.wrong} · Pulos: {studyStats.skipped}
+                                    </div>
+                                    <div className="mt-6 flex items-center justify-center gap-3">
+                                        <button
+                                            type="button"
+                                            onClick={() => setIsStudySessionOpen(false)}
+                                            className="px-5 py-3 rounded-2xl bg-medical-600 hover:bg-medical-700 text-white font-extrabold"
+                                        >
+                                            Fechar
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </>
+                );
+            })()}
+        </div>
+    </div>
+)}
+
+
+
+
             {/* ACERVO (MOVIDO PARA FORA DO GRID, ACIMA DO DASHBOARD) */}
             <div className="mb-8">
                 <div className="glass-panel rounded-3xl shadow-xl shadow-slate-200/50 overflow-hidden w-full">
@@ -1836,7 +2722,7 @@ export default function App() {
                                                 onClick={() => setSelectedCalDay(day)}
                                                 className={[
                                                     "h-12 md:h-14 rounded-xl border text-sm font-extrabold transition relative",
-                                                    isSelected ? "bg-slate-900 text-white border-slate-900" : "bg-white hover:bg-slate-50 border-slate-200 text-slate-800"
+                                                    isSelected ? "bg-medical-600 text-white border-slate-900" : "bg-white hover:bg-slate-50 border-slate-200 text-slate-800"
                                                 ].join(" ")}
                                                 title={hasEvents ? "Há eventos" : ""}
                                             >
@@ -1900,7 +2786,7 @@ export default function App() {
 
             {/* MODAL PREVIEW */}
             {previewCard && (
-                <div className="fixed inset-0 bg-slate-900/90 backdrop-blur-md z-[100] flex items-center justify-center p-4">
+                <div className="fixed inset-0 bg-medical-600 hover:bg-medical-700/90 backdrop-blur-md z-[100] flex items-center justify-center p-4">
                     <div className="bg-white rounded-[1.5rem] md:rounded-[2rem] max-w-6xl w-full h-auto max-h-[90vh] md:h-[90vh] overflow-hidden relative shadow-2xl flex flex-col ring-1 ring-white/20 animate-[fadeIn_0.3s_ease-out]">
                         <div className="px-5 py-4 md:px-8 md:py-5 border-b border-slate-100 flex justify-between items-center bg-white z-10">
                             <div>
@@ -1929,7 +2815,7 @@ export default function App() {
                                             ></div>
                                         </div>
                                     </div>
-                                    <button onClick={() => handleDownload('pf', `${previewCard.concept}_F`)} className="w-full bg-slate-800 text-white py-3 md:py-4 rounded-xl font-bold hover:bg-slate-900 transition flex items-center justify-center gap-2 text-sm md:text-base">⬇ Baixar</button>
+                                    <button onClick={() => handleDownload('pf', `${previewCard.concept}_F`)} className="w-full bg-slate-800 text-white py-3 md:py-4 rounded-xl font-bold hover:bg-medical-600 hover:bg-medical-700 transition flex items-center justify-center gap-2 text-sm md:text-base">⬇ Baixar</button>
                                 </div>
 
                                 {/* BACK */}
@@ -1959,7 +2845,7 @@ export default function App() {
                                             </div>
                                         </div>
                                     </div>
-                                    <button onClick={() => handleDownload('pb', `${previewCard.concept}_V`)} className="w-full bg-slate-800 text-white py-3 md:py-4 rounded-xl font-bold hover:bg-slate-900 transition flex items-center justify-center gap-2 text-sm md:text-base">⬇ Baixar</button>
+                                    <button onClick={() => handleDownload('pb', `${previewCard.concept}_V`)} className="w-full bg-slate-800 text-white py-3 md:py-4 rounded-xl font-bold hover:bg-medical-600 hover:bg-medical-700 transition flex items-center justify-center gap-2 text-sm md:text-base">⬇ Baixar</button>
                                 </div>
 
                             </div>
